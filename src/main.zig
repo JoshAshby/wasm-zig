@@ -4,8 +4,6 @@ const meta = std.meta;
 const trait = std.meta.trait;
 const log = std.log.scoped(.wasm_zig);
 
-var CALLBACK: usize = undefined;
-
 // @TODO: Split these up into own error sets
 pub const Error = error{
     /// Failed to initialize a `Config`
@@ -99,13 +97,7 @@ pub const Module = opaque {
     extern "c" fn wasm_module_exports(?*const Module, *ExportTypeVec) void;
 };
 
-fn cb(params: ?*const Valtype, results: ?*Valtype) callconv(.C) ?*Trap {
-    _ = params;
-    _ = results;
-    const func = @intToPtr(fn () void, CALLBACK);
-    func();
-    return null;
-}
+pub const Callback = fn (?*const ValVec, ?*ValVec) callconv(.C) ?*Trap;
 
 pub const Func = opaque {
     pub const CallError = error{
@@ -124,25 +116,116 @@ pub const Func = opaque {
         /// Function call resulted in an unexpected trap.
         Trap,
     };
-    pub fn init(store: *Store, callback: anytype) !*Func {
+
+    pub fn init(store: *Store, comptime callback: anytype) !*Func {
+        var args: ValtypeVec = undefined;
+        var results: ValtypeVec = undefined;
+
         const cb_meta = @typeInfo(@TypeOf(callback));
+
         switch (cb_meta) {
             .Fn => {
-                if (cb_meta.Fn.args.len > 0 or cb_meta.Fn.return_type.? != void) {
-                    @compileError("only callbacks with no input args and no results are currently supported");
+                const args_len = cb_meta.Fn.args.len;
+
+                if (args_len == 0) {
+                    args = ValtypeVec.empty();
+                } else {
+                    comptime var arg_types: [args_len]Valkind = undefined;
+                    inline for (arg_types) |*arg, i| {
+                        arg.* = switch (cb_meta.Fn.args[i].arg_type.?) {
+                            i32, u32 => .i32,
+                            i64, u64 => .i64,
+                            f32 => .f32,
+                            f64 => .f64,
+                            *Func => .funcref,
+                            *Extern => .anyref,
+                            else => |ty| @compileError("Unsupported argument type '" ++ @typeName(ty) ++ "'"),
+                        };
+                    }
+
+                    args = ValtypeVec.initWithCapacity(args_len);
+                    var i: usize = 0;
+                    var ptr = args.data;
+                    while (i < args_len) : (i += 1) {
+                        ptr.* = Valtype.init(arg_types[i]);
+                        ptr += 1;
+                    }
                 }
+
+                if (cb_meta.Fn.return_type.? == void) {
+                    results = ValtypeVec.empty();
+                } else {
+                    comptime var result_types: [1]Valkind = undefined;
+                    result_types[0] = switch (cb_meta.Fn.return_type.?) {
+                        i32, u32 => .i32,
+                        i64, u64 => .i64,
+                        f32 => .f32,
+                        f64 => .f64,
+                        *Func => .funcref,
+                        *Extern => .anyref,
+                        else => |ty| @compileError("Unsupported return type '" ++ @typeName(ty) ++ "'"),
+                    };
+
+                    results = ValtypeVec.initWithCapacity(1);
+                    var i: usize = 0;
+                    var ptr = results.data;
+                    while (i < 1) : (i += 1) {
+                        ptr.* = Valtype.init(result_types[i]);
+                        ptr += 1;
+                    }
+                }
+
+                const functype = wasm_functype_new(&args, &results) orelse return Error.FuncInit;
+                defer wasm_functype_delete(functype);
+
+                const lambda: Callback = struct {
+                    fn l(params: ?*const ValVec, ress: ?*ValVec) callconv(.C) ?*Trap {
+                        _ = ress;
+                        comptime var type_arr: []const type = &[0]type{};
+
+                        inline for (cb_meta.Fn.args) |arg| {
+                            if (arg.is_generic) unreachable;
+                            type_arr = type_arr ++ @as([]const type, &[1]type{arg.arg_type.?});
+                        }
+
+                        var cb_args: std.meta.Tuple(type_arr) = undefined;
+                        inline for (cb_meta.Fn.args) |arg, i| {
+                            if (arg.is_generic) unreachable;
+
+                            switch (arg.arg_type.?) {
+                                i32, u32 => cb_args[i] = params.?.data[i].of.i32,
+                                i64, u64 => cb_args[i] = params.?.data[i].of.i64,
+                                f32 => cb_args[i] = params.?.data[i].of.f32,
+                                f64 => cb_args[i] = params.?.data[i].of.f64,
+                                *Func => cb_args[i] = @ptrCast(?*Func, params.?.data[i].of.ref).?,
+                                *Extern => cb_args[i] = @ptrCast(?*Extern, params.?.data[i].of.ref).?,
+                                else => |ty| @compileError("Unsupported argument type '" ++ @typeName(ty) ++ "'"),
+                            }
+                        }
+
+                        const result = @call(.{}, callback, cb_args);
+
+                        if (cb_meta.Fn.return_type) |re_type| {
+                            switch (re_type) {
+                                void => {},
+                                i32, u32 => ress.?.data[0] = .{ .kind = .i32, .of = .{ .i32 = @bitCast(i32, result) } },
+                                i64, u64 => ress.?.data[0] = .{ .kind = .i64, .of = .{ .i64 = @bitCast(i64, result) } },
+                                f32 => ress.?.data[0] = .{ .kind = .f32, .of = .{ .f32 = result } },
+                                f64 => ress.?.data[0] = .{ .kind = .f64, .of = .{ .f64 = result } },
+                                *Func => ress.?.data[0] = .{ .kind = .funcref, .of = .{ .ref = result } },
+                                *Extern => ress.?.data[0] = .{ .kind = .anyref, .of = .{ .ref = result } },
+                                else => |ty| @compileError("Unsupported return type '" ++ @typeName(ty) ++ "'"),
+                            }
+                        }
+
+                        return null;
+                    }
+                }.l;
+
+                return wasm_func_new(store, functype, lambda) orelse Error.FuncInit;
             },
             else => @compileError("only functions can be used as callbacks into Wasm"),
         }
-        CALLBACK = @ptrToInt(callback);
-
-        var args = ValtypeVec.empty();
-        var results = ValtypeVec.empty();
-
-        const functype = wasm_functype_new(&args, &results) orelse return Error.FuncInit;
-        defer wasm_functype_delete(functype);
-
-        return wasm_func_new(store, functype, cb) orelse Error.FuncInit;
     }
 
     /// Returns the `Func` as an `Extern`
@@ -242,6 +325,9 @@ pub const Func = opaque {
             else => false,
         };
     }
+
+    extern "c" fn wasm_functype_new(args: *ValtypeVec, results: *ValtypeVec) ?*anyopaque;
+    extern "c" fn wasm_functype_delete(functype: *anyopaque) void;
 
     extern "c" fn wasm_func_new(*Store, ?*anyopaque, Callback) ?*Func;
     extern "c" fn wasm_func_delete(*Func) void;
@@ -584,8 +670,6 @@ pub const ExportTypeVec = extern struct {
     extern "c" fn wasm_exporttype_vec_delete(*ExportTypeVec) void;
 };
 
-pub const Callback = fn (?*const Valtype, ?*Valtype) callconv(.C) ?*Trap;
-
 pub const ByteVec = extern struct {
     size: usize,
     data: [*]u8,
@@ -695,9 +779,34 @@ pub const ValtypeVec = extern struct {
     size: usize,
     data: [*]?*Valtype,
 
-    pub fn empty() ValtypeVec {
-        return .{ .size = 0, .data = undefined };
+    pub fn initWithTypes(valtypes: [*]?*Valtype, len: usize) ValtypeVec {
+        var vec: ValtypeVec = undefined;
+        wasm_valtype_vec_new(&vec, len, &valtypes);
+        return vec;
     }
+
+    pub fn initWithCapacity(len: usize) ValtypeVec {
+        var vec: ValtypeVec = undefined;
+        wasm_valtype_vec_new_uninitialized(&vec, len);
+        return vec;
+    }
+
+    pub fn deinit(self: *ValtypeVec) void {
+        wasm_valtype_vec_delete(self);
+    }
+
+    pub fn empty() ValtypeVec {
+        var vec: ValtypeVec = undefined;
+        wasm_valtype_vec_new_empty(&vec);
+        return vec;
+    }
+
+    extern "c" fn wasm_valtype_vec_new(*ValtypeVec, usize, *const [*]?*Valtype) void;
+    extern "c" fn wasm_valtype_vec_new_empty(*ValtypeVec) void;
+    extern "c" fn wasm_valtype_vec_new_uninitialized(*ValtypeVec, usize) void;
+
+    extern "c" fn wasm_valtype_vec_delete(*ValtypeVec) void;
+    extern "c" fn wasm_valtype_vec_copy(*ValtypeVec, *const *ValtypeVec) void;
 };
 
 pub const ValVec = extern struct {
@@ -717,10 +826,6 @@ pub const ValVec = extern struct {
     extern "c" fn wasm_val_vec_new_uninitialized(*ValVec, usize) void;
     extern "c" fn wasm_val_vec_delete(*ValVec) void;
 };
-
-// Func
-pub extern "c" fn wasm_functype_new(args: *ValtypeVec, results: *ValtypeVec) ?*anyopaque;
-pub extern "c" fn wasm_functype_delete(functype: *anyopaque) void;
 
 pub const WasiConfig = opaque {
     /// Options to inherit when inherriting configs
