@@ -92,9 +92,29 @@ pub const Module = opaque {
         return vec;
     }
 
+    pub fn imports(self: *Module) ImportTypeVec {
+        var vec: ImportTypeVec = undefined;
+        wasm_module_imports(self, &vec);
+        return vec;
+    }
+
     extern "c" fn wasm_module_new(*Store, *const ByteVec) ?*Module;
     extern "c" fn wasm_module_delete(*Module) void;
     extern "c" fn wasm_module_exports(?*const Module, *ExportTypeVec) void;
+    extern "c" fn wasm_module_imports(?*const Module, *ImportTypeVec) void;
+};
+
+pub const ImportType = extern struct {
+    module: ByteVec,
+    name: ByteVec,
+    extern_type: *ExternType
+};
+
+pub const ImportTypeVec = extern struct {
+    size: usize,
+    data: [*]?*ImportType,
+
+    pub fn deinit(_: *ImportTypeVec) void {}
 };
 
 pub const Callback = fn (?*const ValVec, ?*ValVec) callconv(.C) ?*Trap;
@@ -180,7 +200,6 @@ pub const Func = opaque {
 
                 const lambda: Callback = struct {
                     fn l(params: ?*const ValVec, ress: ?*ValVec) callconv(.C) ?*Trap {
-                        _ = ress;
                         comptime var type_arr: []const type = &[0]type{};
 
                         inline for (cb_meta.Fn.args) |arg| {
@@ -287,8 +306,13 @@ pub const Func = opaque {
 
         if (trap) |t| {
             t.deinit();
-            // TODO handle trap message
-            log.err("code unexpectedly trapped", .{});
+
+            // TODO: This is causing a fun segfault when running a WASI start function ¯\_(ツ)_/¯ 
+            const msg = t.message();
+            defer msg.deinit();
+
+            log.err("code unexpectedly trapped - {s}", .{msg.toSlice()});
+
             return CallError.Trap;
         }
 
@@ -357,8 +381,30 @@ pub const Instance = opaque {
 
         if (trap) |t| {
             defer t.deinit();
+
+            const msg = t.message();
+            defer msg.deinit();
+            
             // TODO handle trap message
-            log.err("code unexpectedly trapped", .{});
+            log.err("code unexpectedly trapped - {s}", .{msg.toSlice()});
+            return Error.InstanceInit;
+        }
+
+        return instance orelse Error.InstanceInit;
+    }
+
+    pub fn initExterns(store: *Store, module: *Module, externs: *ExternVec) !*Instance {
+        var trap: ?*Trap = null;
+
+        const instance = wasm_instance_new(store, module, externs, &trap);
+
+        if (trap) |t| {
+            defer t.deinit();
+            const msg = t.message();
+            defer msg.deinit();
+            
+            // TODO handle trap message
+            log.err("code unexpectedly trapped - {s}", .{msg.toSlice()});
             return Error.InstanceInit;
         }
 
@@ -536,17 +582,17 @@ pub const ExternType = opaque {
 
     /// Copies the given export type. Returned copy's memory must be
     /// freed manually by calling `deinit()` on the object.
-    pub fn copy(self: *ExportType) *ExportType {
+    pub fn copy(self: *ExternType) *ExternType {
         return wasm_externtype_copy(self).?;
     }
 
     /// Returns the `ExternKind` from a given export type.
-    pub fn kind(self: *const ExportType) ExternKind {
+    pub fn kind(self: *const ExternType) ExternKind {
         return wasm_externtype_kind(self);
     }
 
-    extern "c" fn wasm_externtype_delete(?*ExportType) void;
-    extern "c" fn wasm_externtype_copy(?*ExportType) ?*ExportType;
+    extern "c" fn wasm_externtype_delete(?*ExternType) void;
+    extern "c" fn wasm_externtype_copy(?*ExternType) ?*ExternType;
     extern "c" fn wasm_externtype_kind(?*const ExternType) ExternKind;
 };
 
@@ -703,25 +749,22 @@ pub const ByteVec = extern struct {
     extern "c" fn wasm_byte_vec_delete(*ByteVec) void;
 };
 
-pub const NameVec = extern struct {
-    size: usize,
-    data: [*]const u8,
-
-    pub fn fromSlice(slice: []const u8) NameVec {
-        return .{ .size = slice.len, .data = slice.ptr };
-    }
-};
-
 pub const ExternVec = extern struct {
     size: usize,
     data: [*]?*Extern,
 
     pub fn empty() ExternVec {
-        return .{ .size = 0, .data = undefined };
+        var externs: ExternVec = undefined;
+        wasm_extern_vec_new_empty(&externs);
+        return externs;
     }
 
     pub fn deinit(self: *ExternVec) void {
         wasm_extern_vec_delete(self);
+    }
+
+    pub fn copy(self: *ExternVec, to: *ExternVec) void {
+        wasm_extern_vec_copy(to, self);
     }
 
     pub fn initWithCapacity(size: usize) ExternVec {
@@ -733,6 +776,7 @@ pub const ExternVec = extern struct {
     extern "c" fn wasm_extern_vec_new_empty(*ExternVec) void;
     extern "c" fn wasm_extern_vec_new_uninitialized(*ExternVec, usize) void;
     extern "c" fn wasm_extern_vec_delete(*ExternVec) void;
+    extern "c" fn wasm_extern_vec_copy(* ExternVec, *const ExternVec) ?*Memory;
 };
 
 pub const Valkind = enum(u8) {
