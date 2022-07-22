@@ -76,12 +76,12 @@ pub const Extern = opaque {
         return wasm_extern_copy(self).?;
     }
 
-    extern "c" fn wasm_extern_as_func(*Extern) ?*Func;
-    extern "c" fn wasm_extern_as_global(*Extern) ?*Global;
-    extern "c" fn wasm_extern_as_memory(*Extern) ?*Memory;
-    extern "c" fn wasm_extern_as_table(*Extern) ?*Table;
-    extern "c" fn wasm_extern_delete(*Extern) void;
-    extern "c" fn wasm_extern_copy(*Extern) ?*Extern;
+    extern "c" fn wasm_extern_as_func(?*Extern) ?*Func;
+    extern "c" fn wasm_extern_as_global(?*Extern) ?*Global;
+    extern "c" fn wasm_extern_as_memory(?*Extern) ?*Memory;
+    extern "c" fn wasm_extern_as_table(?*Extern) ?*Table;
+    extern "c" fn wasm_extern_delete(?*Extern) void;
+    extern "c" fn wasm_extern_copy(?*const Extern) ?*Extern;
 
     // TODO: Are these three eql, toType and kind part of the spec?
     /// Checks if the given externs are equal and returns true if so
@@ -107,17 +107,17 @@ pub const Extern = opaque {
 // [JASHBY] - Done
 pub const ExternVec = extern struct {
     size: usize,
-    data: [*]?*Extern,
-
-    pub fn init(data: []*Extern) ExternVec {
-        var externs: ExternVec = undefined;
-        wasm_extern_vec_new(&externs, data.len, data.ptr);
-        return externs;
-    }
+    data: [*c]?*Extern,
 
     pub fn initEmpty() ExternVec {
         var externs: ExternVec = undefined;
         wasm_extern_vec_new_empty(&externs);
+        return externs;
+    }
+
+    pub fn initFromSlice(data: []*Extern) ExternVec {
+        var externs: ExternVec = undefined;
+        wasm_extern_vec_new(&externs, data.len, data.ptr);
         return externs;
     }
 
@@ -133,6 +133,10 @@ pub const ExternVec = extern struct {
 
     pub fn copy(self: *ExternVec, to: *ExternVec) void {
         wasm_extern_vec_copy(to, self);
+    }
+
+    pub fn toSlice(self: *const ExternVec) []const ?*Extern {
+        return self.data[0..self.size];
     }
 
     extern "c" fn wasm_extern_vec_new(*ExternVec, usize, [*]?*Extern) void;
@@ -171,7 +175,7 @@ pub const Func = opaque {
                 const args_len = cb_meta.Fn.args.len;
 
                 if (args_len == 0) {
-                    args = ValtypeVec.empty();
+                    args = ValtypeVec.initEmpty();
                 } else {
                     comptime var arg_types: [args_len]Valkind = undefined;
                     inline for (arg_types) |*arg, i| {
@@ -187,6 +191,9 @@ pub const Func = opaque {
                     }
 
                     args = ValtypeVec.initWithCapacity(args_len);
+                    // for (args.toSlice()) |*arg, i| {
+                    //     arg = Valtype.init(arg_types[i]);
+                    // }
                     var i: usize = 0;
                     var ptr = args.data;
                     while (i < args_len) : (i += 1) {
@@ -196,7 +203,7 @@ pub const Func = opaque {
                 }
 
                 if (cb_meta.Fn.return_type.? == void) {
-                    results = ValtypeVec.empty();
+                    results = ValtypeVec.initEmpty();
                 } else {
                     comptime var result_types: [1]Valkind = undefined;
                     result_types[0] = switch (cb_meta.Fn.return_type.?) {
@@ -209,6 +216,7 @@ pub const Func = opaque {
                         else => |ty| @compileError("Unsupported return type '" ++ @typeName(ty) ++ "'"),
                     };
 
+                    // TODO: support multiple returns
                     results = ValtypeVec.initWithCapacity(1);
                     var i: usize = 0;
                     var ptr = results.data;
@@ -235,8 +243,8 @@ pub const Func = opaque {
                             if (arg.is_generic) unreachable;
 
                             switch (arg.arg_type.?) {
-                                i32, u32 => cb_args[i] = params.?.data[i].of.i32,
-                                i64, u64 => cb_args[i] = params.?.data[i].of.i64,
+                                i32, u32 => cb_args[i] = @bitCast(i32, params.?.data[i].of.i32),
+                                i64, u64 => cb_args[i] = @bitCast(i64, params.?.data[i].of.i64),
                                 f32 => cb_args[i] = params.?.data[i].of.f32,
                                 f64 => cb_args[i] = params.?.data[i].of.f64,
                                 *Func => cb_args[i] = @ptrCast(?*Func, params.?.data[i].of.ref).?,
@@ -270,23 +278,24 @@ pub const Func = opaque {
         }
     }
 
-    // TODO
-    pub fn initWithEnv(store: *Store, comptime callback: anytype, env: *anyopaque, env_finalizer: anytype) !*Func {
+    // TODO - test this with some code to see how it works with zig
+    pub fn initWithEnv(store: *Store, comptime callback: anytype, env: anytype, comptime env_finalizer: anytype) !*Func {
         var args: ValtypeVec = undefined;
         var results: ValtypeVec = undefined;
 
         const cb_meta = @typeInfo(@TypeOf(callback));
+        const env_type = @TypeOf(env);
 
         switch (cb_meta) {
             .Fn => {
-                const args_len = cb_meta.Fn.args.len;
+                const args_len = cb_meta.Fn.args.len - 1;
 
                 if (args_len == 0) {
-                    args = ValtypeVec.empty();
+                    args = ValtypeVec.initEmpty();
                 } else {
                     comptime var arg_types: [args_len]Valkind = undefined;
                     inline for (arg_types) |*arg, i| {
-                        arg.* = switch (cb_meta.Fn.args[i].arg_type.?) {
+                        arg.* = switch (cb_meta.Fn.args[i+1].arg_type.?) {
                             i32, u32 => .i32,
                             i64, u64 => .i64,
                             f32 => .f32,
@@ -307,7 +316,7 @@ pub const Func = opaque {
                 }
 
                 if (cb_meta.Fn.return_type.? == void) {
-                    results = ValtypeVec.empty();
+                    results = ValtypeVec.initEmpty();
                 } else {
                     comptime var result_types: [1]Valkind = undefined;
                     result_types[0] = switch (cb_meta.Fn.return_type.?) {
@@ -332,9 +341,11 @@ pub const Func = opaque {
                 const functype = wasm_functype_new(&args, &results) orelse return Error.FuncInit;
                 defer wasm_functype_delete(functype);
 
-                const lambda: Callback = struct {
-                    fn l(params: ?*const ValVec, ress: ?*ValVec) callconv(.C) ?*Trap {
+                const lambda: CallbackWithEnv = struct {
+                    fn l(envv: ?*anyopaque, params: ?*const ValVec, ress: ?*ValVec) callconv(.C) ?*Trap {
                         comptime var type_arr: []const type = &[0]type{};
+
+                        // type_arr = type_arr ++ &[1]type{env_type};
 
                         inline for (cb_meta.Fn.args) |arg| {
                             if (arg.is_generic) unreachable;
@@ -345,13 +356,20 @@ pub const Func = opaque {
                         inline for (cb_meta.Fn.args) |arg, i| {
                             if (arg.is_generic) unreachable;
 
+                            if (i == 0) {
+                                cb_args[0] = @ptrCast(env_type, @alignCast(@alignOf(std.meta.Child(env_type)), envv.?));
+                                continue;
+                            }
+
+                            const parg = params.?.data[i - 1];
+
                             switch (arg.arg_type.?) {
-                                i32, u32 => cb_args[i] = params.?.data[i].of.i32,
-                                i64, u64 => cb_args[i] = params.?.data[i].of.i64,
-                                f32 => cb_args[i] = params.?.data[i].of.f32,
-                                f64 => cb_args[i] = params.?.data[i].of.f64,
-                                *Func => cb_args[i] = @ptrCast(?*Func, params.?.data[i].of.ref).?,
-                                *Extern => cb_args[i] = @ptrCast(?*Extern, params.?.data[i].of.ref).?,
+                                i32, u32 => cb_args[i] = @bitCast(i32, parg.of.i32),
+                                i64, u64 => cb_args[i] = @bitCast(i64, parg.of.i64),
+                                f32 => cb_args[i] = parg.of.f32,
+                                f64 => cb_args[i] = parg.of.f64,
+                                *Func => cb_args[i] = @ptrCast(?*Func, parg.of.ref).?,
+                                *Extern => cb_args[i] = @ptrCast(?*Extern, parg.of.ref).?,
                                 else => |ty| @compileError("Unsupported argument type '" ++ @typeName(ty) ++ "'"),
                             }
                         }
@@ -375,10 +393,22 @@ pub const Func = opaque {
                     }
                 }.l;
 
-                return wasm_func_new_with_env(store, functype, lambda, env, env_finalizer) orelse Error.FuncInit;
+                const finalizer: EnvFinalizer = struct {
+                    fn f(envv: ?*anyopaque) callconv(.C) void {
+                        const envvv = @ptrCast(env_type, @alignCast(@alignOf(std.meta.Child(env_type)), envv));
+
+                        _ = @call(.{}, env_finalizer, .{envvv});
+                    }
+                }.f;
+
+                return wasm_func_new_with_env(store, functype, lambda, env, finalizer) orelse Error.FuncInit;
             },
             else => @compileError("only functions can be used as callbacks into Wasm"),
         }
+    }
+
+    pub fn deinit(self: *Func) void {
+        wasm_func_delete(self);
     }
 
     /// Returns the `Func` as an `Extern`
@@ -410,33 +440,45 @@ pub const Func = opaque {
             @compileError("Expected 'args' to be a tuple, but found type '" ++ @typeName(@TypeOf(args)) ++ "'");
 
         const args_len = args.len;
-        comptime var wasm_args: [args_len]Val = undefined;
-        inline for (wasm_args) |*arg, i| {
+
+        comptime var arg_types: [args_len]Valkind = undefined;
+        inline for (arg_types) |*arg, i| {
             arg.* = switch (@TypeOf(args[i])) {
-                i32, u32 => .{ .kind = .i32, .of = .{ .i32 = @bitCast(i32, args[i]) } },
-                i64, u64 => .{ .kind = .i64, .of = .{ .i64 = @bitCast(i64, args[i]) } },
-                f32 => .{ .kind = .f32, .of = .{ .f32 = args[i] } },
-                f64 => .{ .kind = .f64, .of = .{ .f64 = args[i] } },
-                *Func => .{ .kind = .funcref, .of = .{ .ref = args[i] } },
-                *Extern => .{ .kind = .anyref, .of = .{ .ref = args[i] } },
-                else => |ty| @compileError("Unsupported argument type '" ++ @typeName(ty) + "'"),
+                i32, u32 => .i32,
+                i64, u64 => .i64,
+                f32 => .f32,
+                f64 => .f64,
+                *Func => .funcref,
+                *Extern => .anyref,
+                else => |ty| @compileError("Unsupported argument type '" ++ @typeName(ty) ++ "'"),
             };
         }
+
+        var wasm_args = ValVec.initWithCapacity(args_len);
+        comptime var i: usize = 0;
+        var ptr = wasm_args.data;
+        inline while (i < args_len) : (i += 1) {
+            ptr.* = switch (arg_types[i]) {
+                .i32 => .{ .kind = .i32, .of = .{ .i32 = @bitCast(i32, args[i]) } },
+                .i64 => .{ .kind = .i64, .of = .{ .i64 = @bitCast(i64, args[i]) } },
+                .f32 => .{ .kind = .f32, .of = .{ .f32 = args[i] } },
+                .f64 => .{ .kind = .f64, .of = .{ .f64 = args[i] } },
+                .funcref => .{ .kind = .funcref, .of = .{ .ref = args[i] } },
+                .anyref => .{ .kind = .anyref, .of = .{ .ref = args[i] } },
+            };
+            ptr += 1;
+        }
+
 
         // TODO multiple return values
         const result_len: usize = if (ResultType == void) 0 else 1;
         if (result_len != wasm_func_result_arity(self)) return CallError.InvalidResultCount;
         if (args_len != wasm_func_param_arity(self)) return CallError.InvalidParamCount;
 
-        const final_args = ValVec{
-            .size = args_len,
-            .data = if (args_len == 0) undefined else @ptrCast([*]Val, &wasm_args),
-        };
-
         var result_list = ValVec.initWithCapacity(result_len);
         defer result_list.deinit();
 
-        const trap = wasm_func_call(self, &final_args, &result_list);
+        const trap = wasm_func_call(self, &wasm_args, &result_list);
 
         if (trap) |t| {
             t.deinit();
@@ -465,10 +507,6 @@ pub const Func = opaque {
             *Extern => @ptrCast(?*Extern, result_ty.of.ref).?,
             else => |ty| @compileError("Unsupported result type '" ++ @typeName(ty) ++ "'"),
         };
-    }
-
-    pub fn deinit(self: *Func) void {
-        wasm_func_delete(self);
     }
 
     /// Returns tue if the given `kind` of `Valkind` can coerce to type `T`
@@ -500,6 +538,8 @@ pub const Func = opaque {
     extern "c" fn wasm_functype_delete(functype: *anyopaque) void;
 
     extern "c" fn wasm_func_new(*Store, ?*anyopaque, Callback) ?*Func;
+    extern "c" fn wasm_func_new_with_env(*Store, ?*anyopaque, CallbackWithEnv, ?*anyopaque, ?EnvFinalizer) ?*Func;
+
     extern "c" fn wasm_func_delete(*Func) void;
     extern "c" fn wasm_func_as_extern(*Func) ?*Extern;
     extern "c" fn wasm_func_copy(*const Func) ?*Func;
@@ -508,7 +548,6 @@ pub const Func = opaque {
     extern "c" fn wasm_func_param_arity(*Func) usize;
 
     extern "c" fn wasm_func_call(*Func, *const ValVec, *ValVec) ?*Trap;
-    extern "c" fn wasm_func_new_with_env(?*anyopaque, ?*Func, *const ValVec, *ValVec)  ?*Trap;
 
     extern "c" fn wasm_func_type(?*Func) ?*Functype;
 };
@@ -539,14 +578,14 @@ pub const Memory = opaque {
         return wasm_memory_new(store, mem_type) orelse error.MemoryInit;
     }
 
-    /// Returns the `Memorytype` of a given `Memory` object
-    pub fn getType(self: *const Memory) *Memorytype {
-        return wasm_memory_type(self).?;
-    }
-
     /// Frees the memory of the `Memory` object
     pub fn deinit(self: *Memory) void {
         wasm_memory_delete(self);
+    }
+
+    /// Returns the `Memorytype` of a given `Memory` object
+    pub fn getType(self: *const Memory) *Memorytype {
+        return wasm_memory_type(self).?;
     }
 
     /// Creates a copy of the given `Memory` object
@@ -606,7 +645,6 @@ pub const Memory = opaque {
     // TODO
     extern "c" fn wasm_memory_as_extern(?*Memory) ?*Extern;
 };
-
 
 // TODO: implement table and global types
 pub const Table = opaque {
