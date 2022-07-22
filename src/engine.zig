@@ -1,5 +1,4 @@
 const std = @import("std");
-const log = std.log.scoped(.engine).scoped(.eng);
 
 pub const Error = error{
   ConfigInit,
@@ -28,7 +27,7 @@ pub const Engine = opaque {
         return wasm_engine_new() orelse Error.EngineInit;
     }
 
-    pub fn withConfig(config: *Config) !*Engine {
+    pub fn initWithConfig(config: *Config) !*Engine {
         return wasm_engine_new_with_config(config) orelse Error.EngineInit;
     }
 

@@ -5,7 +5,7 @@ const Valkind = @import("value.zig").Valkind;
 
 pub const ByteVec = extern struct {
     size: usize,
-    data: [*]u8,
+    data: [*c]u8,
 
     /// Initializes a new wasm byte vector
     pub fn initWithCapacity(size: usize) ByteVec {
@@ -15,20 +15,20 @@ pub const ByteVec = extern struct {
     }
 
     /// Initializes and copies contents of the input slice
-    pub fn fromSlice(slice: []const u8) ByteVec {
+    pub fn initFromSlice(slice: []const u8) ByteVec {
         var bytes: ByteVec = undefined;
         wasm_byte_vec_new(&bytes, slice.len, slice.ptr);
         return bytes;
     }
 
-    /// Returns a slice to the byte vector
-    pub fn toSlice(self: ByteVec) []const u8 {
-        return self.data[0..self.size];
-    }
-
     /// Frees the memory allocated by initWithCapacity
     pub fn deinit(self: *ByteVec) void {
         wasm_byte_vec_delete(self);
+    }
+
+    /// Returns a slice to the byte vector
+    pub fn toSlice(self: ByteVec) []const u8 {
+        return self.data[0..self.size];
     }
 
     extern "c" fn wasm_byte_vec_new(*ByteVec, usize, [*]const u8) void;
@@ -47,17 +47,17 @@ pub const Exporttype = opaque {
 
 pub const ExporttypeVec = extern struct {
     size: usize,
-    data: [*]?*Exporttype,
+    data: [*c]?*Exporttype,
+
+    pub fn deinit(self: *ExporttypeVec) void {
+        wasm_exporttype_vec_delete(self);
+    }
 
     /// Returns a slice of an `ExporttypeVec`.
     /// Memory is still owned by the runtime and can only be freed using
     /// `deinit()` on the original `ExporttypeVec`
     pub fn toSlice(self: *const ExporttypeVec) []const ?*Exporttype {
         return self.data[0..self.size];
-    }
-
-    pub fn deinit(self: *ExporttypeVec) void {
-        self.wasm_exporttype_vec_delete();
     }
 
     extern "c" fn wasm_exporttype_vec_delete(*ExporttypeVec) void;
@@ -121,6 +121,10 @@ pub const ImporttypeVec = extern struct {
     data: [*]?*Importtype,
 
     pub fn deinit(_: *ImporttypeVec) void {}
+    
+    pub fn toSlice(self: *const ImporttypeVec) []const ?*Importtype {
+        return self.data[0..self.size];
+    }
 };
 
 pub const Valtype = opaque {
@@ -147,9 +151,15 @@ pub const ValtypeVec = extern struct {
     size: usize,
     data: [*]?*Valtype,
 
-    pub fn initWithTypes(valtypes: [*]?*Valtype, len: usize) ValtypeVec {
+    pub fn initEmpty() ValtypeVec {
         var vec: ValtypeVec = undefined;
-        wasm_valtype_vec_new(&vec, len, &valtypes);
+        wasm_valtype_vec_new_empty(&vec);
+        return vec;
+    }
+
+    pub fn initFromSlice(valtypes: []*Valtype) ValtypeVec {
+        var vec: ValtypeVec = undefined;
+        wasm_valtype_vec_new(&vec, valtypes.len, valtypes.ptr);
         return vec;
     }
 
@@ -163,10 +173,8 @@ pub const ValtypeVec = extern struct {
         wasm_valtype_vec_delete(self);
     }
 
-    pub fn empty() ValtypeVec {
-        var vec: ValtypeVec = undefined;
-        wasm_valtype_vec_new_empty(&vec);
-        return vec;
+    pub fn toSlice(self: *const ValtypeVec) []const ?*Valtype {
+        return self.data[0..self.size];
     }
 
     extern "c" fn wasm_valtype_vec_new(*ValtypeVec, usize, *const [*]?*Valtype) void;
